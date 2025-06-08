@@ -1,99 +1,148 @@
 #!/bin/bash
-# Instalare completă Arch Linux cu interfață macOS-like pentru utilizatorul "shamanu"
-# Șterge complet discul /dev/sda și setează totul automat
+set -e
 
-disk="/dev/sda"
-username="shamanu"
-password="30012004"
-hostname="shamanu-os"
+echo "===> Arch Linux + KDE Plasma 6 Auto Installer (with numbered disk select)"
 
-# Configurare tastatură și timp
+# -------- DISK SELECTION --------
+echo "===> Scanning for available disks..."
+
+DISK_LIST=()
+while IFS= read -r line; do
+    DISK_LIST+=("$line")
+done < <(lsblk -d -o NAME,SIZE,MODEL | grep -v "loop\|sr" | tail -n +2)
+
+if [ ${#DISK_LIST[@]} -eq 0 ]; then
+    echo "❌ No physical disks detected!"
+    exit 1
+fi
+
+echo "Available disks:"
+for i in "${!DISK_LIST[@]}"; do
+    disk_info="${DISK_LIST[$i]}"
+    disk_name=$(echo "$disk_info" | awk '{print $1}')
+    disk_size=$(echo "$disk_info" | awk '{print $2}')
+    disk_model=$(echo "$disk_info" | cut -d' ' -f3-)
+    echo "  [$i] /dev/$disk_name - $disk_size - $disk_model"
+done
+
+read -p "Enter the number of the disk to use: " DISK_NUM
+
+if ! [[ "$DISK_NUM" =~ ^[0-9]+$ ]] || [ "$DISK_NUM" -ge "${#DISK_LIST[@]}" ]; then
+    echo "❌ Invalid selection."
+    exit 1
+fi
+
+DISK="/dev/$(echo "${DISK_LIST[$DISK_NUM]}" | awk '{print $1}')"
+echo "✅ Selected disk: $DISK"
+
+# -------- USER INPUT --------
+read -p "Enter hostname: " HOSTNAME
+read -p "Enter username: " USERNAME
+read -s -p "Enter password for root and $USERNAME: " PASSWORD
+echo
+
+# -------- INTERNET CHECK --------
+ping -c 1 archlinux.org &>/dev/null || {
+    echo "⚠  No internet detected. Run 'iwctl' for Wi-Fi or plug in Ethernet."
+    read -p "Press Enter to continue when connected..."
+}
+
+# -------- SETUP --------
 loadkeys us
 timedatectl set-ntp true
 
-# Partiționare discul
-parted -s $disk mklabel msdos
-parted -s $disk mkpart primary ext4 1MiB 512MiB
-parted -s $disk set 1 boot on
-parted -s $disk mkpart primary ext4 512MiB 100%
-mkfs.ext4 ${disk}1
-mkfs.ext4 ${disk}2
+echo "===> Partitioning disk (MBR mode)..."
+sleep 3
 
-mount ${disk}2 /mnt
+(
+echo o      # new MBR
+echo n      # partition 1
+echo p
+echo 1
+echo
+echo +512M
+echo n      # partition 2
+echo p
+echo 2
+echo
+echo
+echo a      # bootable flag
+echo 1
+echo w
+) | fdisk "$DISK"
+
+PART_BOOT="${DISK}1"
+PART_ROOT="${DISK}2"
+
+echo "===> Formatting partitions..."
+mkfs.ext4 "$PART_ROOT"
+mkfs.ext4 "$PART_BOOT"
+
+echo "===> Mounting..."
+mount "$PART_ROOT" /mnt
 mkdir /mnt/boot
-mount ${disk}1 /mnt/boot
+mount "$PART_BOOT" /mnt/boot
 
-# Instalare pachete de bază și UI macOS-like
-pacstrap /mnt base linux linux-firmware networkmanager grub sudo git xorg   xfce4 xfce4-goodies lightdm lightdm-gtk-greeter plank conky   papirus-icon-theme ttf-dejavu ttf-liberation ttf-droid   feh imagemagick wget curl
+# -------- INSTALL BASE SYSTEM --------
+pacstrap /mnt base linux linux-firmware vim nano networkmanager sudo
 
 genfstab -U /mnt >> /mnt/etc/fstab
 
+# -------- CHROOT CONFIGURATION --------
 arch-chroot /mnt /bin/bash <<EOF
-ln -sf /usr/share/zoneinfo/UTC /etc/localtime
-hwclock --systohc
 
-echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+# Time & Locale
+ln -sf /usr/share/zoneinfo/Europe/Bucharest /etc/localtime
+hwclock --systohc
+echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
 locale-gen
 echo "LANG=en_US.UTF-8" > /etc/locale.conf
 
-echo "$hostname" > /etc/hostname
-cat >> /etc/hosts <<EOL
+# Hostname
+echo "$HOSTNAME" > /etc/hostname
+cat <<EOT >> /etc/hosts
 127.0.0.1   localhost
 ::1         localhost
-127.0.1.1   $hostname.localdomain $hostname
-EOL
+127.0.1.1   $HOSTNAME.localdomain $HOSTNAME
+EOT
 
-echo "root:$password" | chpasswd
-useradd -m -G wheel $username
-echo "$username:$password" | chpasswd
-sed -i 's/^# %wheel ALL=(ALL) ALL/%wheel ALL=(ALL) ALL/' /etc/sudoers
+# User and Root
+echo "root:$PASSWORD" | chpasswd
+useradd -m -G wheel -s /bin/bash $USERNAME
+echo "$USERNAME:$PASSWORD" | chpasswd
+echo "%wheel ALL=(ALL:ALL) ALL" >> /etc/sudoers
 
-grub-install --target=i386-pc --boot-directory=/boot $disk
+# Bootloader
+pacman -Sy --noconfirm grub
+grub-install --target=i386-pc $DISK
 grub-mkconfig -o /boot/grub/grub.cfg
 
+# Swap file
+fallocate -l 2G /swapfile
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
+echo "/swapfile none swap defaults 0 0" >> /etc/fstab
+
+# Enable NetworkManager
 systemctl enable NetworkManager
-systemctl enable lightdm
 
-# Logo + text SHAMANU
-wget -O /usr/share/pixmaps/shamanu-logo.png "https://raw.githubusercontent.com/Shamanul/archnac/main/shamanu-logo.png"
-convert -resize 50x50 /usr/share/pixmaps/shamanu-logo.png /usr/share/pixmaps/shamanu-logo-small.png
-convert -size 250x50 xc:none   /usr/share/pixmaps/shamanu-logo-small.png -geometry +0+0 -composite   -font Helvetica -pointsize 24 -fill white -draw "text 60,35 'SHAMANU'"   /usr/share/pixmaps/gfx-corner.png
+# KDE Plasma 6
+pacman -Sy --noconfirm xorg plasma-desktop dolphin konsole sddm
 
-# Wallpaper
-wget -O /usr/share/backgrounds/macOS-wallpaper.jpg "https://512pixels.net/downloads/macos-wallpapers/11-0-Daylight.jpg"
+systemctl enable sddm
 
-# Configurare LightDM cu logo + text
-cat > /etc/lightdm/lightdm-gtk-greeter.conf <<GREETER
-[greeter]
-background=/usr/share/backgrounds/macOS-wallpaper.jpg
-theme-name=Adwaita
-icon-theme-name=Papirus
-font-name=Sans 12
-GREETER
+# Utilities
+pacman -Sy --noconfirm firefox neofetch htop tlp
+systemctl enable tlp
 
-# Setare automată interfață pentru utilizator
-sudo -u $username bash -c '
-mkdir -p ~/.config/autostart
-cat > ~/.config/autostart/gfx-corner.desktop <<EOAUTOSTART
-[Desktop Entry]
-Name=SHAMANU-GFX
-Exec=sh -c "sleep 5 && feh --bg-center /usr/share/pixmaps/gfx-corner.png --no-xinerama --geometry +20+20"
-Type=Application
-EOAUTOSTART
-'
-# Yay & aplicații din AUR
-sudo -u $username bash -c '
-cd ~
-git clone https://aur.archlinux.org/yay.git
-cd yay && makepkg -si --noconfirm
-yay -S --noconfirm google-chrome pycharm-community-edition
-xdg-settings set default-web-browser google-chrome.desktop
-'
+# Enable multilib
+sed -i '/\[multilib\]/,/Include/s/^#//' /etc/pacman.conf
+pacman -Sy
 
-echo "SHAMANU - Instalare completă terminată."
 EOF
 
+# -------- FINISH --------
+echo "===> Done. Unmounting and rebooting..."
 umount -R /mnt
-echo "Repornește sistemul în 5 secunde..."
-sleep 5
 reboot
